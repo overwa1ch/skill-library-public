@@ -91,9 +91,17 @@ def read_skill(path):
         for key in ("name", "description"):
             if not isinstance(meta.get(key), str) or not meta[key].strip():
                 raise LibraryError("Missing non-empty " + key + ": " + str(path))
+        policy = read_policy(path)
+        # Claude Code marks user-invocable-only skills in frontmatter; either
+        # host's opt-out makes the skill explicit-only.
+        manual = meta.get("disable-model-invocation", False)
+        if type(manual) is not bool:
+            raise LibraryError("disable-model-invocation must be boolean: " + str(path))
+        if manual:
+            policy["allow_implicit_invocation"] = False
         return {"name": meta["name"], "description": meta["description"],
                 "path": str(path), "skill_root": str(path.parent),
-                "sha256": digest(data), "text": text, **read_policy(path)}
+                "sha256": digest(data), "text": text, **policy}
     except (OSError, UnicodeError, StopIteration, yaml.YAMLError) as exc:
         raise LibraryError("Cannot read skill " + str(path) + ": " + str(exc)) from exc
 
@@ -540,7 +548,20 @@ class _CatalogWatchState:
         return (registry_stamp, tuple(sources))
 
 
-def serve(lib):
+HOSTS = ("codex", "generic")
+CODEX_INSTRUCTIONS = "Always discover and load relevant workflows here BEFORE research, web, notes, writing, code, data or media work, even for short replies. If tool_search fails, inspect ALL_TOOLS metadata. Skip only arithmetic, translation and punctuation-only edits."
+GENERIC_DISCOVERY = "Before research, web, notes, writing, code, data or media work, check this Library's current tool list for matching per-skill load tools and load a relevant workflow before acting, even for short replies. Skip only arithmetic, translation and punctuation-only edits."
+GENERIC_EXPLICIT = "If load_explicit_skill is available, call it only when the user names a skill; never choose one from the task topic alone."
+
+
+def server_instructions(lib, host):
+    """Session-wide guidance must remain valid as the available tools change."""
+    if host == "codex":
+        return CODEX_INSTRUCTIONS
+    return " ".join((GENERIC_DISCOVERY, GENERIC_EXPLICIT))
+
+
+def serve(lib, host="codex"):
     """One JSON-RPC object per line, as required by MCP stdio."""
     write_lock = threading.Lock()
     ready = threading.Event()
@@ -608,7 +629,7 @@ def serve(lib):
                         "protocolVersion": version if version in supported else "2025-06-18",
                         "capabilities": {"tools": {"listChanged": True}},
                         "serverInfo": {"name": "skill-library", "version": "0.1.0"},
-                        "instructions": "Always discover and load relevant workflows here BEFORE research, web, notes, writing, code, data or media work, even for short replies. If tool_search fails, inspect ALL_TOOLS metadata. Skip only arithmetic, translation and punctuation-only edits."
+                        "instructions": server_instructions(lib, host)
                     }
                 elif method == "ping":
                     result = {}
@@ -680,7 +701,9 @@ def main():
     source.add_argument("plan")
     sub.add_parser("tools")
     sub.add_parser("status", help="Report live source availability without changing enabled state")
-    sub.add_parser("serve")
+    srv = sub.add_parser("serve")
+    srv.add_argument("--host", choices=HOSTS, default="codex",
+                     help="Instruction wording: codex keeps Codex tool names; generic suits any MCP client")
     load = sub.add_parser("load")
     load.add_argument("id")
     edit = sub.add_parser("edit")
@@ -693,7 +716,7 @@ def main():
     lib = Library(args.registry)
     try:
         if args.command == "serve":
-            serve(lib)
+            serve(lib, args.host)
             return 0
         if args.command == "init":
             result = lib.init()

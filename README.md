@@ -1,4 +1,4 @@
-# Codex Skill Library
+# Skill Library
 
 本地 Skill 注册表与只读 MCP 加载器。将技能正文保存在本地，通过 MCP 工具按需发现和加载，并保留脚本、模板与参考资料的原始目录。
 
@@ -9,7 +9,8 @@
 - 稳定技能 ID、来源标识、分类标签、启停状态和常驻选择。
 - 读取原始 `SKILL.md`，返回正文摘要、技能目录和附件的相对路径基准。
 - 每个允许自动触发的技能提供一个加载工具；只允许点名的技能通过 `load_explicit_skill` 加载。
-- 尊重 `agents/openai.yaml` 中的 `policy.allow_implicit_invocation`。
+- 尊重 `agents/openai.yaml` 中的 `policy.allow_implicit_invocation`，以及 SKILL.md frontmatter 中 Claude Code 的 `disable-model-invocation: true`。
+- 支持 Codex、Claude Code、Claude Desktop、Cursor 等 MCP 客户端：Codex 写 `config.toml`，其他客户端用 `configure.py plan --format mcp-json` 写各自的 `mcpServers` JSON。
 - 检查来源可用性，停用来源和已确认失效的插件来源拒绝加载。
 - 配置修改先生成计划，应用时备份，回滚保留无关的并发改动。
 
@@ -20,8 +21,8 @@
 Python 3.9+，当前以 macOS 验证。文件锁依赖 POSIX `fcntl`，暂不支持 Windows。
 
 ```sh
-git clone https://github.com/overwa1ch/codex-skill-library-public.git
-cd codex-skill-library-public
+git clone https://github.com/overwa1ch/skill-library-public.git
+cd skill-library-public
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python library.py --registry runtime/registry.json init
@@ -70,12 +71,39 @@ python3 -m venv .venv
 
 ```toml
 [mcp_servers.skill_library]
-command = "/absolute/codex-skill-library-public/.venv/bin/python"
-args = ["/absolute/codex-skill-library-public/library.py", "--registry", "/absolute/codex-skill-library-public/runtime/registry.json", "serve"]
+command = "/absolute/skill-library-public/.venv/bin/python"
+args = ["/absolute/skill-library-public/library.py", "--registry", "/absolute/skill-library-public/runtime/registry.json", "serve"]
 enabled = true
 ```
 
 手动配置 MCP 只接入服务；原生技能目录的展示项需另行管理，避免重复发现。配置写入后，在宿主中核对工具列表和实际技能加载。
+
+## 接入使用 JSON 配置的客户端
+
+客户端需要支持 stdio MCP，并用顶层 `mcpServers` 对象登记服务。先查明客户端实际读取的配置文件，将下方路径替换为该文件的绝对路径。
+
+```sh
+.venv/bin/python configure.py plan --format mcp-json --config /absolute/client-config.json --registry runtime/registry.json --output runtime/client-plan.json
+.venv/bin/python configure.py apply --plan runtime/client-plan.json --transactions runtime/transactions
+.venv/bin/python configure.py rollback runtime/transactions/TRANSACTION_ID
+```
+
+应用前检查计划。JSON 计划只管理 `mcpServers.skill-library`；应用时保留文件内其他字段的最新值，同名服务与计划不一致时拒绝覆盖。`placement: global` 的技能继续由宿主管理，JSON 计划只校验 Library 实际提供的技能。
+
+也可以在客户端配置中手动加入以下服务，将每个路径替换为真实绝对路径：
+
+```json
+{
+  "mcpServers": {
+    "skill-library": {
+      "command": "/absolute/skill-library-public/.venv/bin/python",
+      "args": ["/absolute/skill-library-public/library.py", "--registry", "/absolute/skill-library-public/runtime/registry.json", "serve", "--host", "generic"]
+    }
+  }
+}
+```
+
+`--host generic` 提供通用 MCP 提示语。技能文件的 `disable-model-invocation: true` 与 `agents/openai.yaml` 中的点名策略均会生效。应用或重新连接后，在客户端确认工具目录并加载一个已注册技能；合成测试不能证明客户端已经采用新配置。
 
 ## 可选流程检查规则
 
@@ -85,6 +113,13 @@ enabled = true
 .venv/bin/python bootstrap.py plan --path /absolute/codex-home/AGENTS.md --output runtime/bootstrap-plan.json
 .venv/bin/python bootstrap.py apply --plan runtime/bootstrap-plan.json --transactions runtime/bootstrap-transactions
 .venv/bin/python bootstrap.py rollback runtime/bootstrap-transactions/TRANSACTION_ID
+```
+
+其他宿主可用 `--host generic` 生成通用规则，目标文件名支持 `AGENTS.md`、`CLAUDE.md` 和 `GEMINI.md`。以下示例仍须使用宿主实际读取的路径：
+
+```sh
+.venv/bin/python bootstrap.py plan --host generic --path /absolute/instructions/CLAUDE.md --output runtime/client-bootstrap-plan.json
+.venv/bin/python bootstrap.py apply --plan runtime/client-bootstrap-plan.json --transactions runtime/bootstrap-transactions
 ```
 
 该规则包含短任务的发现检查；是否安装应结合使用场景决定。只允许用户点名的技能仍要求明确点名。

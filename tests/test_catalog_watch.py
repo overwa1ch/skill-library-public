@@ -77,8 +77,11 @@ serve(Counted(sys.argv[2]))
 
     def stabilize_idle_metadata(self):
         # This one test's premise is stable metadata, including absent policies.
-        # Capture real stat/lstat results at child startup; do not replace the
-        # watcher signature, registry reads, skill reads, or loading requests.
+        # Capture real stat/lstat results at child startup and fix the Path
+        # methods used by the watcher. Python 3.9's pathlib caches OS functions,
+        # so replacing os.stat/os.lstat would leave the watcher unfrozen.
+        # Do not replace the watcher signature, registry reads, skill reads,
+        # or loading requests.
         # The other notification tests continue using the real filesystem.
         stable_metadata = '''import json, os
 _real_stat, _real_lstat = os.stat, os.lstat
@@ -95,18 +98,27 @@ for _path in _paths:
             _metadata[(str(_path), _follow)] = (True, _read_stat(_path))
         except OSError as _error:
             _metadata[(str(_path), _follow)] = (False, (_error.errno, _error.strerror))
-def _stable_stat(path, *, dir_fd=None, follow_symlinks=True):
-    if dir_fd is None and not isinstance(path, int):
-        key = (os.path.abspath(os.fsdecode(path)), follow_symlinks)
-        if key in _metadata:
-            present, value = _metadata[key]
-            if present:
-                return value
-            raise OSError(value[0], value[1], os.fspath(path))
-    return _real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
-def _stable_lstat(path, *, dir_fd=None):
-    return _stable_stat(path, dir_fd=dir_fd, follow_symlinks=False)
-os.stat, os.lstat = _stable_stat, _stable_lstat
+def _stable_stat(path, *, follow_symlinks=True):
+    key = (os.path.abspath(os.fspath(path)), follow_symlinks)
+    if key in _metadata:
+        present, value = _metadata[key]
+        if present:
+            return value
+        raise OSError(value[0], value[1], os.fspath(path))
+    return _real_stat(path, follow_symlinks=follow_symlinks)
+def _stable_lstat(path):
+    return _stable_stat(path, follow_symlinks=False)
+Path.stat, Path.lstat = _stable_stat, _stable_lstat
+# Prove both Path methods use the frozen view, even on Python versions that
+# retain their own references to the OS functions.
+_probe = _real_stat(_registry)
+try:
+    os.utime(_registry, ns=(_probe.st_atime_ns, _probe.st_mtime_ns + 1000000000))
+    assert _real_stat(_registry).st_mtime_ns != _probe.st_mtime_ns
+    assert _registry.stat().st_mtime_ns == _probe.st_mtime_ns, 'Path.stat bypasses frozen metadata'
+    assert _registry.lstat().st_mtime_ns == _probe.st_mtime_ns, 'Path.lstat bypasses frozen metadata'
+finally:
+    os.utime(_registry, ns=(_probe.st_atime_ns, _probe.st_mtime_ns))
 '''
         code = self.wrapper.read_text()
         self.wrapper.write_text(code.replace('class Counted(Library):',

@@ -102,6 +102,24 @@ class ConfigTests(unittest.TestCase):
         rollback(result["transaction"])
         self.assertFalse(self.config.exists())
 
+    def test_legacy_codex_plan_and_transaction_keep_default_format(self):
+        plan = self.plan()
+        del plan["format"]
+        del plan["server_name"]
+        result = apply(plan, self.root / "transactions")
+        record_path = Path(result["transaction"]) / "transaction.json"
+        record = json.loads(record_path.read_text())
+        for key in ("sources", "runtime", "unavailable_sources", "inactive_sources"):
+            record.pop(key, None)
+        record_path.write_text(json.dumps(record))
+        doc = tomlkit.parse(self.config.read_text())
+        doc["model"] = "external-model"
+        self.config.write_text(tomlkit.dumps(doc))
+        rollback(result["transaction"])
+        final = tomlkit.parse(self.config.read_text()).unwrap()
+        self.assertEqual(final["model"], "external-model")
+        self.assertNotIn(SERVER, final["mcp_servers"])
+
     def test_global_system_not_disabled(self):
         self.lib.edit(self.entry["id"], placement="global")
         p = self.plan()

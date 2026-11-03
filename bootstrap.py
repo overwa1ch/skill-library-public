@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Install a small, owned Skill Library routing rule without replacing user instructions."""
+"""Install a small, owned Skill Library routing rule without replacing user instructions.
+
+Targets a global instructions file: AGENTS.md (Codex and other AGENTS.md hosts),
+CLAUDE.md (Claude Code) or GEMINI.md (Gemini CLI).
+"""
 import argparse
 import fcntl
 import json
@@ -20,6 +24,14 @@ BLOCK = (BEGIN + '\n## Skill Library workflow check\n\n'
     'if it is unavailable, inspect ALL_TOOLS metadata. Skip this check only for arithmetic, '
     'translation and punctuation-only edits. Load explicit-only workflows only when the user names them. '
     'If the Library is unavailable, use the normal skill workflow.\n' + END + '\n')
+GENERIC_BLOCK = (BEGIN + '\n## Skill Library workflow check\n\n'
+    'When Skill Library is available, before research, web, notes, writing, code, data or media work, '
+    'check its tools for matching workflows and load applicable ones before answering or acting. '
+    'This includes short replies and tasks without file writes. Skip this check only for arithmetic, '
+    'translation and punctuation-only edits. Load explicit-only workflows only when the user names them. '
+    'If the Library is unavailable, use the normal skill workflow.\n' + END + '\n')
+BLOCKS = {'codex': BLOCK, 'generic': GENERIC_BLOCK}
+INSTRUCTION_FILES = ('AGENTS.md', 'CLAUDE.md', 'GEMINI.md')
 
 
 def write_target(path, data, expected, expected_exists, remove=False):
@@ -74,13 +86,13 @@ def write_target(path, data, expected, expected_exists, remove=False):
 
 def check_path(path):
     path = Path(path).expanduser().absolute()
-    if path.name != 'AGENTS.md' or path.is_symlink():
-        raise LibraryError('Bootstrap requires a regular AGENTS.md path')
+    if path.name not in INSTRUCTION_FILES or path.is_symlink():
+        raise LibraryError('Bootstrap requires a regular ' + ', '.join(INSTRUCTION_FILES) + ' path')
     if path.exists() and not path.is_file():
         raise LibraryError('Bootstrap target is not a file')
     if any(parent.is_symlink() for parent in path.parents):
         raise LibraryError('Bootstrap parent path changed to a symlink')
-    if (path.parent / 'AGENTS.override.md').exists():
+    if path.name == 'AGENTS.md' and (path.parent / 'AGENTS.override.md').exists():
         raise LibraryError('AGENTS.override.md shadows bootstrap; resolve it explicitly')
     return path
 
@@ -98,25 +110,28 @@ def span(text):
     return start, end
 
 
-def desired(text):
+def desired(text, host='codex'):
+    block = BLOCKS[host]
     owned = span(text)
     if owned:
-        if text[owned[0]:owned[1]] != BLOCK:
+        if text[owned[0]:owned[1]] != block:
             raise LibraryError('Existing owned rule differs; roll back its transaction before replacing it')
-        return text[:owned[0]] + BLOCK + text[owned[1]:]
+        return text[:owned[0]] + block + text[owned[1]:]
     separator = '' if not text else ('\n' if text.endswith('\n') else '\n\n')
-    return text + separator + BLOCK
+    return text + separator + block
 
 
-def make_plan(path):
+def make_plan(path, host='codex'):
+    if host not in BLOCKS:
+        raise LibraryError('Unknown bootstrap host: ' + str(host))
     raw = Path(path).expanduser().absolute()
     if raw.is_symlink():
-        raise LibraryError('Bootstrap requires a regular AGENTS.md path')
+        raise LibraryError('Bootstrap requires a regular ' + ', '.join(INSTRUCTION_FILES) + ' path')
     path = raw.parent.resolve() / raw.name
     path = check_path(path)
     before = path.read_bytes().decode('utf-8') if path.exists() else ''
-    after = desired(before)
-    return {'version': 1, 'path': str(path), 'existed': path.exists(),
+    after = desired(before, host)
+    return {'version': 1, 'host': host, 'path': str(path), 'existed': path.exists(),
             'before': before, 'after': after, 'before_sha256': sha(before.encode()),
             'after_sha256': sha(after.encode())}
 
@@ -127,6 +142,8 @@ def validate(record):
         raise LibraryError('Invalid bootstrap record')
     if not isinstance(record.get('path'), str) or not Path(record['path']).is_absolute():
         raise LibraryError('Invalid bootstrap path')
+    if record.get('host', 'codex') not in BLOCKS:
+        raise LibraryError('Unknown bootstrap host')
     for key in ('before', 'after'):
         if (not isinstance(record.get(key), str)
                 or not re.fullmatch('[0-9a-f]{64}', record.get(key + '_sha256', ''))
@@ -153,7 +170,7 @@ def validate(record):
 def apply(plan, transactions):
     validate(plan)
     path = check_path(plan['path'])
-    if desired(plan['before']) != plan['after']:
+    if desired(plan['before'], plan.get('host', 'codex')) != plan['after']:
         raise LibraryError('Bootstrap plan does not match current routing rule')
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(str(path) + '.skill-library.lock', 'a') as lock:
@@ -224,7 +241,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('plan')
-    p.add_argument('--path', required=True)
+    p.add_argument('--path', required=True, help='Global AGENTS.md, CLAUDE.md or GEMINI.md')
+    p.add_argument('--host', choices=sorted(BLOCKS), default='codex',
+                   help='Rule wording: codex mentions ALL_TOOLS; generic suits any host')
     p.add_argument('--output', required=True)
     p = sub.add_parser('apply')
     p.add_argument('--plan', required=True)
@@ -233,7 +252,7 @@ def main():
     p.add_argument('transaction')
     args = parser.parse_args()
     if args.command == 'plan':
-        result = make_plan(args.path)
+        result = make_plan(args.path, args.host)
         atomic(Path(args.output), (json.dumps(result, ensure_ascii=False, indent=2) + '\n').encode())
         print(json.dumps({'plan': args.output, 'added_bytes': len(result['after'].encode()) - len(result['before'].encode())}))
     elif args.command == 'apply':
