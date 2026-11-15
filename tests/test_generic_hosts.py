@@ -1,26 +1,28 @@
 """Hosts other than Codex: Claude-style policy, generic MCP wording, JSON configs and CLAUDE.md."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 import bootstrap
 import configure
-from configure import JSON_SERVER, apply, make_plan, rollback
+from configure import JSON_SERVER, apply, detect_format, make_plan, rollback
 from library import CODEX_INSTRUCTIONS, Library, LibraryError
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def initialize(registry, *extra):
+def initialize(registry, *extra, client="generic-host-test"):
     """Run one initialize round trip and return the server instructions."""
     request = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                          "clientInfo": {"name": "generic-host-test", "version": "1"}}}
+                          "clientInfo": {"name": client, "version": "1"}}}
     out = subprocess.run([sys.executable, str(ROOT / "library.py"), "--registry", str(registry),
                           "serve", *extra], input=(json.dumps(request) + "\n").encode(),
                          capture_output=True, timeout=10, check=True).stdout
@@ -67,8 +69,18 @@ class GenericHostTests(unittest.TestCase):
 
     # Server instructions
 
-    def test_codex_wording_is_the_default(self):
-        self.assertEqual(initialize(self.registry), CODEX_INSTRUCTIONS)
+    def test_default_wording_follows_the_client(self):
+        self.assertEqual(initialize(self.registry, client="codex-mcp-client"), CODEX_INSTRUCTIONS)
+        for client in ("claude-code", "generic-host-test"):
+            text = initialize(self.registry, client=client)
+            self.assertIn("load tools", text)
+            self.assertNotIn("ALL_TOOLS", text)
+
+    def test_explicit_host_overrides_the_client(self):
+        self.assertEqual(initialize(self.registry, "--host", "codex", client="claude-code"),
+                         CODEX_INSTRUCTIONS)
+        self.assertNotIn("ALL_TOOLS", initialize(self.registry, "--host", "generic",
+                                                 client="codex-mcp-client"))
 
     def test_generic_wording_has_no_codex_tool_names(self):
         implicit = initialize(self.registry, "--host", "generic")
@@ -243,7 +255,7 @@ class GenericHostTests(unittest.TestCase):
         self.assertEqual(config.read_bytes(), host_bytes)
         self.assertEqual(list(config.parent.glob(".skill-library-*")), [])
         record = json.loads((Path(result["transaction"]) / "transaction.json").read_text())
-        self.assertEqual(record["status"], "applied")
+        self.assertEqual(record["status"], "rolling_back")
 
     def test_json_rollback_preserves_original_container_and_external_server_edits(self):
         config = self.root / "claude.json"
@@ -320,6 +332,15 @@ class GenericHostTests(unittest.TestCase):
             bootstrap.make_plan(target, "codex")
         bootstrap.rollback(result["transaction"])
         self.assertEqual(target.read_text(), "# Mine\n")
+
+    def test_cli_defaults_follow_the_target_file(self):
+        self.assertEqual(detect_format(self.root / "config.toml"), "codex-toml")
+        self.assertEqual(detect_format(self.root / ".claude.json"), "mcp-json")
+        codex_home = self.root / "codex-home"
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+            self.assertEqual(bootstrap.default_host(codex_home / "AGENTS.md"), "codex")
+            self.assertEqual(bootstrap.default_host(self.root / "AGENTS.md"), "generic")
+            self.assertEqual(bootstrap.default_host(codex_home / "CLAUDE.md"), "generic")
 
     def test_bootstrap_still_rejects_other_file_names(self):
         with self.assertRaisesRegex(LibraryError, "Bootstrap requires a regular"):

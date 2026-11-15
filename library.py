@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import sys
 import tempfile
@@ -26,6 +27,7 @@ class _RegistryState(dict):
     def __init__(self, value):
         super().__init__(value)
         self.write_checks = []
+        self.after_write = []
 
 
 def digest(data):
@@ -35,7 +37,7 @@ def digest(data):
 def canonical_path(path):
     try:
         return Path(path).expanduser().resolve()
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise LibraryError("Cannot resolve path: " + str(exc)) from exc
 
 
@@ -106,9 +108,119 @@ def read_skill(path):
         raise LibraryError("Cannot read skill " + str(path) + ": " + str(exc)) from exc
 
 
+def tree_manifest(root):
+    """File digests, link targets and folders under root, keyed by relative path."""
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise LibraryError("Expected a real directory: " + str(root))
+    manifest = {"": "dir:" + oct(stat.S_IMODE(root.stat().st_mode))}
+    def walk_error(error):
+        raise LibraryError("Cannot inspect relocation source: " + str(error)) from error
+    for folder, dirs, files in os.walk(root, onerror=walk_error):
+        for name in dirs + files:
+            path = Path(folder) / name
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                manifest[relative] = "link:" + os.readlink(path)
+            elif path.is_dir():
+                manifest[relative] = "dir:" + oct(stat.S_IMODE(path.stat().st_mode))
+            else:
+                info = path.stat()
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise LibraryError("Special files and hardlinks cannot be relocated: " + str(path))
+                manifest[relative] = "file:" + oct(stat.S_IMODE(info.st_mode)) + ":" + digest(path.read_bytes())
+    return manifest
+
+
+def absolute_link_depends_on_root(target, root):
+    """Check every step of an absolute symlink target, including expanded links.
+
+    Checking only the final resolved destination misses an external alias that
+    passes through root and then links back outside it. That alias would still
+    break when root is moved.
+    """
+    target = Path(target)
+    # POSIX permits exactly two leading slashes, which Python preserves as a
+    # distinct anchor even on systems where it resolves to the same root.
+    current = Path("/")
+    pending = list(target.parts[1:])
+    followed = 0
+    while pending:
+        part = pending.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        candidate = current / part
+        if candidate == root or root in candidate.parents:
+            return True
+        if candidate.is_symlink():
+            followed += 1
+            if followed > 40:
+                raise LibraryError("Absolute link cannot be safely resolved: " + str(target))
+            expansion = Path(os.readlink(candidate))
+            if expansion.is_absolute():
+                current = Path("/")
+                pending = list(expansion.parts[1:]) + pending
+            else:
+                pending = list(expansion.parts) + pending
+        else:
+            current = candidate
+    return False
+
+
+def relative_link_depends_on_root(parent, target, root):
+    """Detect a relative link that escapes through an alias and returns to the old root."""
+    current = parent
+    pending = list(target.parts)
+    followed = 0
+    while pending:
+        part = pending.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        candidate = current / part
+        if not candidate.is_symlink():
+            current = candidate
+            continue
+        followed += 1
+        if followed > 40:
+            raise LibraryError("Relative link cannot be safely resolved: " + str(parent / target))
+        expansion = Path(os.readlink(candidate))
+        expanded = expansion if expansion.is_absolute() else current / expansion
+        normalized = Path(os.path.normpath(expanded))
+        if expansion.is_absolute() or (normalized != root and root not in normalized.parents):
+            return absolute_link_depends_on_root(expanded.joinpath(*pending), root)
+        pending = list(expansion.parts) + pending
+    return False
+
+
+def write_record(path, value):
+    fd, tmp = tempfile.mkstemp(prefix=".record-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 class Library:
     def __init__(self, registry):
-        self.path = Path(registry).expanduser().absolute()
+        # Compatibility aliases must share the same lock and atomic-write target.
+        self.path = canonical_path(registry)
 
     def read(self):
         if not self.path.exists():
@@ -281,6 +393,13 @@ class Library:
                 if (self.path.read_bytes() if self.path.exists() else None) != before:
                     raise LibraryError("Registry changed while preparing transaction; refusing to overwrite")
                 os.replace(tmp, self.path)
+                directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+                for finish in state.after_write:
+                    finish()
             finally:
                 if os.path.exists(tmp):
                     os.unlink(tmp)
@@ -300,6 +419,26 @@ class Library:
     def register(self, path, source, scope="user", enabled=True, tags=()):
         return self.import_entries([{"path": str(path), "source": source, "scope": scope,
                                      "enabled": enabled, "tags": list(tags)}])[0]
+
+    def scan(self, folder, source_prefix, tags=(), enabled=True):
+        """Register every skill folder directly under folder, for hosts without an inventory API.
+
+        Each SKILL.md becomes one user-scope entry whose source is prefix/folder-name.
+        Hidden folders (such as Codex's .system) are skipped. Repeated scans keep
+        existing entries unchanged.
+        """
+        folder = canonical_path(folder)
+        if not folder.is_dir():
+            raise LibraryError("Scan requires an existing folder: " + str(folder))
+        if not isinstance(source_prefix, str) or not source_prefix.strip("/"):
+            raise LibraryError("Scan requires a non-empty source prefix")
+        entries = [{"path": str(child / "SKILL.md"), "source": source_prefix.rstrip("/") + "/" + child.name,
+                    "scope": "user", "enabled": enabled, "tags": list(tags)}
+                   for child in sorted(folder.iterdir())
+                   if not child.name.startswith(".") and (child / "SKILL.md").is_file()]
+        if not entries:
+            raise LibraryError("No skill folders with SKILL.md under " + str(folder))
+        return self.import_entries(entries)
 
     def import_entries(self, entries):
         """Import one reviewed inventory atomically; never infer a path rebind."""
@@ -324,6 +463,10 @@ class Library:
         imported = []
         with self.transaction() as state:
             for candidate in prepared:
+                if candidate['enabled']:
+                    # Recheck after taking the registry lock: a relocation may
+                    # have moved this source while registration was waiting.
+                    read_skill(candidate['path'])
                 previous = next((s for s in state["skills"]
                                  if str(canonical_path(s["path"])) == candidate["path"]), None)
                 if previous is not None:
@@ -344,6 +487,8 @@ class Library:
             path = read_skill(path)["path"]
         with self.transaction() as state:
             item = self.entry(state, sid)
+            if path is not None:
+                read_skill(path)
             if enabled is not None:
                 item["enabled"] = enabled
             if placement is not None:
@@ -353,6 +498,15 @@ class Library:
             if path is not None:
                 item["path"] = path
             return dict(item)
+
+    def relocate(self, sid, into=None, *, package_root=None, self_contained=False):
+        from relocation import Relocator
+        return Relocator(self, sys.modules[__name__]).relocate(
+            sid, into, package_root=package_root, self_contained=self_contained)
+
+    def relocate_rollback(self, record_dir):
+        from relocation import Relocator
+        return Relocator(self, sys.modules[__name__]).rollback(record_dir)
 
     def listing(self, tag=None, include_disabled=False, tools_only=False, include_inactive=False):
         items = []
@@ -548,10 +702,19 @@ class _CatalogWatchState:
         return (registry_stamp, tuple(sources))
 
 
-HOSTS = ("codex", "generic")
+HOSTS = ("auto", "codex", "generic")
+CODEX_CLIENTS = ("codex-mcp-client",)
 CODEX_INSTRUCTIONS = "Always discover and load relevant workflows here BEFORE research, web, notes, writing, code, data or media work, even for short replies. If tool_search fails, inspect ALL_TOOLS metadata. Skip only arithmetic, translation and punctuation-only edits."
 GENERIC_DISCOVERY = "Before research, web, notes, writing, code, data or media work, check this Library's current tool list for matching per-skill load tools and load a relevant workflow before acting, even for short replies. Skip only arithmetic, translation and punctuation-only edits."
 GENERIC_EXPLICIT = "If load_explicit_skill is available, call it only when the user names a skill; never choose one from the task topic alone."
+
+
+def resolve_host(host, client_info):
+    """auto follows the client's self-reported name; only Codex gets the Codex wording."""
+    if host != "auto":
+        return host
+    name = client_info.get("name") if isinstance(client_info, dict) else None
+    return "codex" if name in CODEX_CLIENTS else "generic"
 
 
 def server_instructions(lib, host):
@@ -561,7 +724,7 @@ def server_instructions(lib, host):
     return " ".join((GENERIC_DISCOVERY, GENERIC_EXPLICIT))
 
 
-def serve(lib, host="codex"):
+def serve(lib, host="auto"):
     """One JSON-RPC object per line, as required by MCP stdio."""
     write_lock = threading.Lock()
     ready = threading.Event()
@@ -629,7 +792,8 @@ def serve(lib, host="codex"):
                         "protocolVersion": version if version in supported else "2025-06-18",
                         "capabilities": {"tools": {"listChanged": True}},
                         "serverInfo": {"name": "skill-library", "version": "0.1.0"},
-                        "instructions": server_instructions(lib, host)
+                        "instructions": server_instructions(
+                            lib, resolve_host(host, params.get("clientInfo")))
                     }
                 elif method == "ping":
                     result = {}
@@ -691,6 +855,12 @@ def main():
     add.add_argument("--scope", choices=["system", "user", "repo", "admin", "plugin"], default="user")
     add.add_argument("--disabled", action="store_true")
     add.add_argument("--tag", action="append", default=[])
+    scan = sub.add_parser("scan", help="Register every skill folder directly under a folder")
+    scan.add_argument("folder")
+    scan.add_argument("--source-prefix", required=True,
+                      help="Stable identity prefix; each skill's source is prefix/folder-name")
+    scan.add_argument("--disabled", action="store_true")
+    scan.add_argument("--tag", action="append", default=[])
     imp = sub.add_parser("import-manifest", help="Import a reviewed explicit inventory atomically")
     imp.add_argument("manifest", help="JSON object containing a skills array with path/source/scope/enabled")
     ls = sub.add_parser("list")
@@ -702,8 +872,8 @@ def main():
     sub.add_parser("tools")
     sub.add_parser("status", help="Report live source availability without changing enabled state")
     srv = sub.add_parser("serve")
-    srv.add_argument("--host", choices=HOSTS, default="codex",
-                     help="Instruction wording: codex keeps Codex tool names; generic suits any MCP client")
+    srv.add_argument("--host", choices=HOSTS, default="auto",
+                     help="Instruction wording: auto picks codex for Codex clients and generic otherwise")
     load = sub.add_parser("load")
     load.add_argument("id")
     edit = sub.add_parser("edit")
@@ -712,6 +882,15 @@ def main():
     edit.add_argument("--placement", choices=["global", "library"])
     edit.add_argument("--tags", nargs="*")
     edit.add_argument("--path", help="Explicitly rebind an existing identity to an updated source path")
+    move = sub.add_parser("relocate", help="Move a skill's folder out of host skill folders into the Library")
+    move.add_argument("id")
+    move.add_argument("--into", help="Library-owned folder (default: skills/ beside the registry)")
+    boundary = move.add_mutually_exclusive_group(required=True)
+    boundary.add_argument("--package-root", help="Confirmed complete package root to move, preserving its layout")
+    boundary.add_argument("--self-contained", action="store_true",
+                          help="Confirm this standalone skill has no resources outside its own folder")
+    undo = sub.add_parser("relocate-rollback", help="Restore a relocated skill's original folder")
+    undo.add_argument("relocation", help="Relocation record folder printed by relocate")
     args = p.parse_args()
     lib = Library(args.registry)
     try:
@@ -722,6 +901,13 @@ def main():
             result = lib.init()
         elif args.command == "register":
             result = lib.register(args.path, args.source, args.scope, not args.disabled, args.tag)
+        elif args.command == "scan":
+            result = lib.scan(args.folder, args.source_prefix, args.tag, not args.disabled)
+        elif args.command == "relocate":
+            result = lib.relocate(args.id, args.into, package_root=args.package_root,
+                                  self_contained=args.self_contained)
+        elif args.command == "relocate-rollback":
+            result = lib.relocate_rollback(args.relocation)
         elif args.command == "import-manifest":
             manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
             if not isinstance(manifest, dict):

@@ -60,7 +60,25 @@ def write_target(path, data, expected, expected_exists, remove=False):
         linked, opened = os.stat(path.parent), os.fstat(parent)
         if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
             raise LibraryError('Bootstrap parent changed during replacement')
+        def verify_target():
+            # Staging and fsync can take time. Recheck through the anchored
+            # directory immediately before mutation, preserving concurrent edits.
+            check_path(path)
+            linked = os.stat(path.parent)
+            if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+                raise LibraryError('Bootstrap parent changed during replacement')
+            try:
+                target = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            except FileNotFoundError:
+                latest, latest_exists = b'', False
+            else:
+                with os.fdopen(target, 'rb') as stream:
+                    latest = stream.read()
+                latest_exists = True
+            if latest != expected or latest_exists != expected_exists:
+                raise LibraryError('Global instructions changed before replacement')
         if remove:
+            verify_target()
             if exists:
                 os.unlink(path.name, dir_fd=parent)
         else:
@@ -71,6 +89,7 @@ def write_target(path, data, expected, expected_exists, remove=False):
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
+            verify_target()
             os.replace(temp, path.name, src_dir_fd=parent, dst_dir_fd=parent)
             temp = None
         os.fsync(parent)
@@ -108,6 +127,13 @@ def span(text):
     if text[end:end + 1] == '\n':
         end += 1
     return start, end
+
+
+def default_host(path):
+    """Codex wording only for Codex's own AGENTS.md; every other file gets the neutral rule."""
+    codex_home = Path(os.environ.get('CODEX_HOME', '~/.codex')).expanduser().resolve()
+    path = Path(path).expanduser().resolve()
+    return 'codex' if path.name == 'AGENTS.md' and path.parent == codex_home else 'generic'
 
 
 def desired(text, host='codex'):
@@ -242,8 +268,9 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('plan')
     p.add_argument('--path', required=True, help='Global AGENTS.md, CLAUDE.md or GEMINI.md')
-    p.add_argument('--host', choices=sorted(BLOCKS), default='codex',
-                   help='Rule wording: codex mentions ALL_TOOLS; generic suits any host')
+    p.add_argument('--host', choices=sorted(BLOCKS),
+                   help='Rule wording: codex mentions ALL_TOOLS; generic suits any host '
+                        '(default: codex only for $CODEX_HOME/AGENTS.md)')
     p.add_argument('--output', required=True)
     p = sub.add_parser('apply')
     p.add_argument('--plan', required=True)
@@ -252,7 +279,7 @@ def main():
     p.add_argument('transaction')
     args = parser.parse_args()
     if args.command == 'plan':
-        result = make_plan(args.path, args.host)
+        result = make_plan(args.path, args.host or default_host(args.path))
         atomic(Path(args.output), (json.dumps(result, ensure_ascii=False, indent=2) + '\n').encode())
         print(json.dumps({'plan': args.output, 'added_bytes': len(result['after'].encode()) - len(result['before'].encode())}))
     elif args.command == 'apply':

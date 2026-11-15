@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class SourceLifecycleTests(unittest.TestCase):
     def setUp(self):
+        (ROOT / 'tmp').mkdir(exist_ok=True)
         temporary = tempfile.TemporaryDirectory(dir=ROOT / 'tmp')
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

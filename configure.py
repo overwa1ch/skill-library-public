@@ -30,6 +30,11 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def detect_format(config):
+    """Codex is the TOML host; every other supported host keeps mcpServers in JSON."""
+    return "codex-toml" if Path(config).suffix == ".toml" else "mcp-json"
+
+
 def plan_format(plan):
     # Plans and transactions written before JSON hosts existed are Codex plans.
     return plan.get("format", "codex-toml")
@@ -73,6 +78,23 @@ def plain(item):
     return item.unwrap() if hasattr(item, "unwrap") else item
 
 
+def equivalent_json_server(left, right):
+    """Compare only documented stdio defaults; retain all other conflict guards.
+
+    Several clients omit type=stdio and an empty env mapping. Missing args,
+    non-empty environment changes, cwd, and unknown extra fields are not
+    interchangeable, because they may change how the process is launched.
+    """
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return left == right
+    def normalized(value):
+        result = copy.deepcopy(value)
+        result.setdefault("type", "stdio")
+        result.setdefault("env", {})
+        return result
+    return normalized(left) == normalized(right)
+
+
 def skill_entries(doc):
     items = doc.get("skills", {}).get("config", [])
     if not isinstance(plain(items), list):
@@ -96,6 +118,13 @@ def target_value(doc, change, name=SERVER, fmt="codex-toml"):
         if str(canonical_path(item["path"])) == change["path"]:
             return copy.deepcopy(plain(item))
     return None
+
+
+def target_matches(doc, change, expected, name=SERVER, fmt="codex-toml"):
+    value = target_value(doc, change, name, fmt)
+    if fmt == "mcp-json" and change["kind"] == "server":
+        return equivalent_json_server(value, expected)
+    return value == expected
 
 
 def set_target(doc, change, value, name=SERVER, fmt="codex-toml"):
@@ -139,12 +168,20 @@ def make_plan(config, registry, executable, program, ids=None, unavailable_ids=(
         raise LibraryError("Unknown configuration format: " + str(fmt))
     name = name or (JSON_SERVER if fmt == "mcp-json" else SERVER)
     config = canonical_path(config)
-    before = config.read_bytes() if config.exists() else b""
+    config_existed = config.exists()
+    before = config.read_bytes() if config_existed else b""
     doc = parse(before, fmt)
     if fmt == "codex-toml":
         skill_entries(doc)
     lib = Library(registry)
-    all_entries = lib.read()["skills"]
+    # Bind decisions and checksums to the same immutable registry snapshot.
+    registry_before = lib.path.read_bytes()
+    try:
+        registry_state = json.loads(registry_before)
+    except (UnicodeError, ValueError) as exc:
+        raise LibraryError("Unreadable registry: " + str(exc)) from exc
+    lib.validate(registry_state)
+    all_entries = registry_state["skills"]
     approved_unavailable = set(unavailable_ids or ())
     eligible = {e["id"] for e in all_entries if e["enabled"] and e["placement"] == "library"
                 and lib.source_current(e)}
@@ -190,7 +227,12 @@ def make_plan(config, registry, executable, program, ids=None, unavailable_ids=(
         if not Path(path).is_file():
             raise LibraryError("Missing runtime file: " + path)
         runtime.append({"path": path, "sha256": sha(Path(path).read_bytes())})
-    change = {"kind": "server", "before": target_value(doc, {"kind": "server"}, name, fmt), "after": server}
+    previous_server = target_value(doc, {"kind": "server"}, name, fmt)
+    if (fmt == "mcp-json" and previous_server is not None
+            and equivalent_json_server(previous_server, server)):
+        # Keep a client's original representation rather than add default keys.
+        server = previous_server
+    change = {"kind": "server", "before": previous_server, "after": server}
     if change["before"] not in (None, server):
         raise LibraryError("Existing " + name + " server differs; do not overwrite")
     changes = [change] if change["before"] != server else []
@@ -206,14 +248,16 @@ def make_plan(config, registry, executable, program, ids=None, unavailable_ids=(
             changes.append(dict(change, before=previous, after=after))
     plan = {"version": 1, "format": fmt, "server_name": name,
             "config": str(config), "before_sha256": sha(before),
-            "config_existed": config.exists(), "changes": changes,
-            "registry": str(lib.path), "registry_sha256": sha(lib.path.read_bytes()),
+            "config_existed": config_existed, "changes": changes,
+            "registry": str(lib.path), "registry_sha256": sha(registry_before),
             "sources": sources, "runtime": runtime, "unavailable_sources": unavailable,
             "inactive_sources": [{"id": e["id"], "path": e["path"], "source_state": e["source_state"]}
                                  for e in all_entries if lib.source_inactive(e)]}
     if fmt == "mcp-json" and not changes:
         # No mutation still requires the installed, owned server to match.
         plan["unchanged_server"] = server
+    if lib.path.read_bytes() != registry_before:
+        raise LibraryError("Registry changed during plan; regenerate plan")
     return plan
 
 
@@ -253,6 +297,13 @@ def validate_plan(plan, require_inputs=True):
         for field in ("before", "after"):
             if field not in change or (change[field] is not None and not isinstance(change[field], dict)):
                 raise LibraryError("Invalid plan target value")
+    if "status" in plan and plan["status"] not in ("prepared", "applied", "rolling_back", "rolled_back"):
+        raise LibraryError("Invalid configuration transaction status")
+    if plan.get("status") == "rolling_back":
+        if (not isinstance(plan.get("rollback_result_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", plan["rollback_result_sha256"])
+                or type(plan.get("rollback_result_existed")) is not bool):
+            raise LibraryError("Invalid configuration rollback checkpoint")
     if require_inputs:
         for name in ("sources", "runtime"):
             if not isinstance(plan.get(name), list):
@@ -332,7 +383,7 @@ def verify_inputs(plan):
         raise LibraryError("Registry changed during input verification; regenerate plan")
 
 
-def atomic(path, data, mode=0o600, *, expected=None,
+def atomic(path, data, mode=0o600, *, expected=None, expected_exists=None,
            conflict_message="Configuration changed during write"):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".skill-library-", dir=str(path.parent))
@@ -344,7 +395,9 @@ def atomic(path, data, mode=0o600, *, expected=None,
             os.fsync(stream.fileno())
         # Stage and verify expensive inputs before this last content check.
         # A non-cooperating writer can still race between this check and replace.
-        if expected is not None and (path.read_bytes() if path.exists() else b"") != expected:
+        exists = path.exists()
+        if ((expected_exists is not None and exists != expected_exists)
+                or (expected is not None and (path.read_bytes() if exists else b"") != expected)):
             raise LibraryError(conflict_message)
         os.replace(tmp, path)
     finally:
@@ -360,30 +413,33 @@ def apply(plan, transactions):
     with open(str(path) + ".skill-library.lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         verify_inputs(plan)
-        before = path.read_bytes() if path.exists() else b""
+        before_exists = path.exists()
+        before = path.read_bytes() if before_exists else b""
         # JSON host files such as ~/.claude.json are rewritten by the running host,
         # so for them only the owned server entry has to match the plan.
-        if fmt == "codex-toml" and sha(before) != plan["before_sha256"]:
+        if fmt == "codex-toml" and (sha(before) != plan["before_sha256"]
+                                    or before_exists != plan["config_existed"]):
             raise LibraryError("Configuration changed after plan; regenerate plan")
         doc = parse(before, fmt)
         if not plan["changes"]:
             if fmt == "mcp-json":
                 if "unchanged_server" in plan:
-                    if target_value(doc, {"kind": "server"}, name, fmt) != plan["unchanged_server"]:
+                    if not equivalent_json_server(
+                            target_value(doc, {"kind": "server"}, name, fmt), plan["unchanged_server"]):
                         raise LibraryError("Plan target conflict")
                 elif sha(before) != plan["before_sha256"]:
                     # Legacy JSON no-op plans have no owned-target snapshot.
                     raise LibraryError("Configuration changed after plan; regenerate plan")
             return {"changed": False, "transaction": None}
         for change in plan["changes"]:
-            if target_value(doc, change, name, fmt) != change["before"]:
+            if not target_matches(doc, change, change["before"], name, fmt):
                 raise LibraryError("Plan target conflict")
             set_target(doc, change, change["after"], name, fmt)
         after = dumps(doc, fmt, before)
         parse(after, fmt)
         record = dict(plan, after_sha256=sha(after), status="prepared")
         if fmt == "mcp-json":
-            record.update(before_sha256=sha(before), config_existed=path.exists())
+            record.update(before_sha256=sha(before), config_existed=before_exists)
         txn = Path(transactions).absolute() / uuid.uuid4().hex
         txn.mkdir(parents=True, mode=0o700)
         before_name, after_name = backup_names(fmt)
@@ -392,7 +448,8 @@ def apply(plan, transactions):
         atomic(txn / "transaction.json", (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode())
         verify_inputs(plan)
         atomic(path, after, (path.stat().st_mode & 0o777) if path.exists() else 0o600,
-               expected=before, conflict_message="Configuration changed during apply; no overwrite")
+               expected=before, expected_exists=before_exists,
+               conflict_message="Configuration changed during apply; no overwrite")
         record["status"] = "applied"
         atomic(txn / "transaction.json", (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode())
         return {"changed": True, "transaction": str(txn), "after_sha256": sha(after)}
@@ -410,34 +467,63 @@ def rollback(txn):
     path = Path(record["config"])
     with open(str(path) + ".skill-library.lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        current = path.read_bytes() if path.exists() else b""
+        # Another rollback may have completed while this caller waited for the lock.
+        record = json.loads(record_path.read_text())
+        validate_plan(record, require_inputs=False)
+        if record["config"] != str(path) or plan_format(record) != fmt or server_name(record) != name:
+            raise LibraryError("Configuration transaction changed while waiting for lock")
+        if record.get("status") == "rolled_back":
+            return {"changed": False, "status": "already_rolled_back"}
+        current_exists = path.exists()
+        current = path.read_bytes() if current_exists else b""
         original = (txn / backup_names(fmt)[0]).read_bytes()
         if sha(original) != record["before_sha256"]:
             raise LibraryError("Backup checksum mismatch")
-        if current == original and record.get("status") == "prepared":
+        restored = False
+        if record.get("status") == "rolling_back":
+            restored = (sha(current) == record["rollback_result_sha256"]
+                        and current_exists == record["rollback_result_existed"])
+            if not restored:
+                # Preserve unrelated host edits made after a successful restore.
+                doc = parse(current, fmt)
+                restored = all(target_matches(doc, change, change["before"], name, fmt)
+                               for change in record["changes"])
+        if restored:
             result = current
+        elif current == original and current_exists == record["config_existed"]:
+            # Also recover legacy transactions interrupted after byte-exact restore.
+            result = current
+            restored = True
         elif sha(current) == record["after_sha256"]:
             result = original
         else:
             doc = parse(current, fmt)
             for change in reversed(record["changes"]):
-                if target_value(doc, change, name, fmt) != change["after"]:
+                if not target_matches(doc, change, change["after"], name, fmt):
                     raise LibraryError("Rollback conflict: target changed externally")
                 set_target(doc, change, change["before"], name, fmt)
             if fmt == "mcp-json" and record["changes"] and "mcpServers" in parse(original, fmt):
                 # Preserve the original container without restoring other hosts' keys.
                 doc.setdefault("mcpServers", {})
             result = dumps(doc, fmt, current)
-        if not record["config_existed"] and not result:
-            if (path.read_bytes() if path.exists() else b"") != current:
-                raise LibraryError("Configuration changed during rollback")
-            path.unlink(missing_ok=True)
-        else:
-            atomic(path, result, (path.stat().st_mode & 0o777) if path.exists() else 0o600,
-                   expected=current, conflict_message="Configuration changed during rollback")
+        result_exists = current_exists if restored else (record["config_existed"] or bool(result))
+        if not restored:
+            # Persist the recovery checkpoint before replacing or removing config.
+            record.update(status="rolling_back", rollback_result_sha256=sha(result),
+                          rollback_result_existed=result_exists)
+            atomic(record_path, (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode())
+            if not result_exists:
+                if (path.exists() != current_exists
+                        or (path.read_bytes() if path.exists() else b"") != current):
+                    raise LibraryError("Configuration changed during rollback")
+                path.unlink(missing_ok=True)
+            else:
+                atomic(path, result, (path.stat().st_mode & 0o777) if path.exists() else 0o600,
+                       expected=current, expected_exists=current_exists,
+                       conflict_message="Configuration changed during rollback")
         record["status"] = "rolled_back"
         atomic(record_path, (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode())
-        return {"changed": current != result, "status": "rolled_back"}
+        return {"changed": current != result or current_exists != result_exists, "status": "rolled_back"}
 
 
 def main():
@@ -445,8 +531,9 @@ def main():
     sub = p.add_subparsers(dest="command", required=True)
     plan = sub.add_parser("plan")
     plan.add_argument("--config", required=True)
-    plan.add_argument("--format", choices=FORMATS, default="codex-toml",
-                      help="codex-toml for Codex config.toml; mcp-json for any mcpServers JSON file")
+    plan.add_argument("--format", choices=FORMATS,
+                      help="codex-toml for Codex config.toml; mcp-json for any mcpServers JSON file "
+                           "(default: by the config file's extension)")
     plan.add_argument("--server-name", help="Server key to own (default skill_library for Codex, skill-library for JSON)")
     plan.add_argument("--registry", required=True)
     plan.add_argument("--python", default=sys.executable)
@@ -464,7 +551,8 @@ def main():
     try:
         if args.command == "plan":
             result = make_plan(args.config, args.registry, args.python, args.program, args.id,
-                               args.allow_unavailable, args.format, args.server_name)
+                               args.allow_unavailable, args.format or detect_format(args.config),
+                               args.server_name)
             atomic(Path(args.output), (json.dumps(result, ensure_ascii=False, indent=2) + "\n").encode())
             print(json.dumps({"plan": args.output, "change_count": len(result["changes"]),
                               "before_sha256": result["before_sha256"]}))

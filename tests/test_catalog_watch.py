@@ -29,6 +29,7 @@ class CountingClient(StdioClient):
 
 class CatalogWatchTests(unittest.TestCase):
     def setUp(self):
+        (ROOT / 'tmp').mkdir(exist_ok=True)
         temporary = tempfile.TemporaryDirectory(dir=ROOT / 'tmp')
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
