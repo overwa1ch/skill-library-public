@@ -184,6 +184,23 @@ class RegistryTests(unittest.TestCase):
         self.lib.edit(entry["id"], enabled=True)
         invalid = call(6, "tools/call", {"name": name, "arguments": {"id": "fake"}})["result"]
         self.assertTrue(invalid["isError"])
+        null_args = call(7, "tools/call", {"name": name, "arguments": None})["result"]
+        self.assertFalse(null_args["isError"])
+        p.stdin.buffer.write(b"\xff\xfe\n")
+        p.stdin.buffer.flush()
+        bad_utf8 = json.loads(p.stdout.readline())
+        self.assertEqual(bad_utf8["error"]["code"], -32700)
+        self.assertEqual(call(8, "ping", {})["result"], {})
+
+    def test_indented_triple_dash_in_multiline_description_is_preserved(self):
+        skill = self.root / "multiline" / "SKILL.md"
+        skill.parent.mkdir()
+        skill.write_text(
+            "---\nname: multiline\ndescription: |\n  First paragraph\n  ---\n  Second paragraph\n---\nBody\n"
+        )
+        entry = self.lib.register(skill, "fixture:multiline")
+        loaded = self.lib.load(entry["id"])
+        self.assertIn("Second paragraph", loaded["description"])
 
 
 if __name__ == "__main__":

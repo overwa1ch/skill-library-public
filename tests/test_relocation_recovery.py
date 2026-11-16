@@ -11,6 +11,7 @@ from unittest.mock import patch
 import bootstrap
 import library
 from library import Library, LibraryError
+import relocation
 from relocation import Relocator
 
 
@@ -150,7 +151,7 @@ class RelocationRecoveryTests(unittest.TestCase):
             target.mkdir()
             (target / 'partial').write_text('partial')
             raise OSError('partial copy')
-        with patch.object(library.shutil, 'copytree', side_effect=interrupted):
+        with patch.object(relocation.shutil, 'copytree', side_effect=interrupted):
             with self.assertRaisesRegex(LibraryError, 'partial copy'):
                 self.relocate()
         write = library.write_record
@@ -195,14 +196,14 @@ class RelocationRecoveryTests(unittest.TestCase):
         unregistered = self.package / 'third/SKILL.md'
         unregistered.parent.mkdir()
         unregistered.write_text('---\nname: third\ndescription: Fixture.\n---\nBody\n')
-        copy = library.shutil.copytree
+        copy = relocation.shutil.copytree
         added = []
         def register_during_copy(*args, **kwargs):
             result = copy(*args, **kwargs)
             if Path(args[0]) == self.package and not added:
                 added.append(self.lib.register(unregistered, 'fixture:third'))
             return result
-        with patch.object(library.shutil, 'copytree', side_effect=register_during_copy):
+        with patch.object(relocation.shutil, 'copytree', side_effect=register_during_copy):
             with self.assertRaisesRegex(LibraryError, 'membership changed'):
                 self.relocate()
         self.assertTrue(self.package.exists())
@@ -263,6 +264,30 @@ class RelocationRecoveryTests(unittest.TestCase):
             self.lib.relocate(entry['id'], self_contained=True)
         self.assertTrue(source.is_symlink())
         self.assertEqual(self.lib.load(entry['id'])['skill_root'], str(renamed))
+
+    def test_rollback_succeeds_when_destination_was_occupied_during_copy(self):
+        source = self.root / 'occupied-case'
+        source.mkdir()
+        path = source / 'SKILL.md'
+        path.write_text('---\nname: occupied\ndescription: Fixture.\n---\nBody\n')
+        entry = self.lib.register(path, 'fixture:occupied')
+        copy = relocation.shutil.copytree
+        target = self.lib.path.parent / 'sources/personal/occupied-case'
+
+        def occupy_during_copy(*args, **kwargs):
+            res = copy(*args, **kwargs)
+            target.mkdir(parents=True)
+            (target / 'SKILL.md').write_text('---\nname: unrelated\ndescription: Foreign.\n---\nForeign\n')
+            return res
+
+        with patch.object(relocation.shutil, 'copytree', side_effect=occupy_during_copy):
+            with self.assertRaisesRegex(LibraryError, 'occupied'):
+                self.lib.relocate(entry['id'], self_contained=True)
+        reloc_dir = max((self.lib.path.parent / 'relocations').iterdir())
+        outcome = self.lib.relocate_rollback(reloc_dir)
+        self.assertEqual(outcome['status'], 'rolled_back')
+        self.assertIn('Foreign', (target / 'SKILL.md').read_text())
+        self.assertEqual(self.lib.load(entry['id'])['path'], str(path))
 
 
 if __name__ == '__main__':

@@ -1,5 +1,8 @@
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -139,3 +142,115 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaisesRegex(LibraryError, 'conflict'):
             bootstrap.rollback(result['transaction'])
         self.assertEqual(self.path.read_bytes(), current)
+
+    def test_rollback_checks_file_existence_for_empty_and_deleted_targets(self):
+        self.path.unlink()
+        with patch.object(bootstrap, 'write_target', side_effect=OSError('interrupted apply')):
+            with self.assertRaises(OSError):
+                self.apply()
+        prepared = next((self.root / 'transactions').iterdir())
+        self.path.touch()
+        with self.assertRaisesRegex(LibraryError, 'conflict'):
+            bootstrap.rollback(prepared)
+        self.assertTrue(self.path.exists())
+
+        self.path.write_bytes(b'')
+        applied = bootstrap.apply(bootstrap.make_plan(self.path), self.root / 'transactions-empty')
+        self.path.unlink()
+        with self.assertRaisesRegex(LibraryError, 'conflict'):
+            bootstrap.rollback(applied['transaction'])
+        self.assertFalse(self.path.exists())
+
+        self.path.write_bytes(self.original)
+        applied_full = bootstrap.apply(bootstrap.make_plan(self.path), self.root / 'transactions-full')
+        txn_file = Path(applied_full['transaction']) / 'transaction.json'
+        record = json.loads(txn_file.read_text())
+        record.update(status='rolling_back', rollback_result=self.original.decode(),
+                      rollback_result_sha256=bootstrap.sha(self.original),
+                      rollback_result_existed=True)
+        txn_file.write_text(json.dumps(record))
+        self.path.unlink()
+        with self.assertRaisesRegex(LibraryError, 'conflict'):
+            bootstrap.rollback(applied_full['transaction'])
+        self.assertFalse(self.path.exists())
+
+    def test_rollback_rereads_transaction_after_lock(self):
+        result = self.apply()
+        txn_file = Path(result['transaction']) / 'transaction.json'
+        real_flock = bootstrap.fcntl.flock
+        completed = []
+
+        def concurrent_complete(fd, op):
+            real_flock(fd, op)
+            if not completed:
+                completed.append(True)
+                self.path.write_text('# Unrelated instructions after rollback\n')
+                record = json.loads(txn_file.read_text())
+                record['status'] = 'rolled_back'
+                txn_file.write_text(json.dumps(record))
+
+        with patch.object(bootstrap.fcntl, 'flock', side_effect=concurrent_complete):
+            outcome = bootstrap.rollback(result['transaction'])
+        self.assertEqual(outcome, {'changed': False, 'status': 'already_rolled_back'})
+        self.assertEqual(self.path.read_text(), '# Unrelated instructions after rollback\n')
+
+    def test_write_target_open_failure_preserves_error_and_closes_parent(self):
+        plan = bootstrap.make_plan(self.path)
+        real_open = bootstrap.os.open
+        real_close = bootstrap.os.close
+        opened_dirs, closed_dirs = [], []
+
+        def tracked_open(name, flags, *args, **kwargs):
+            if isinstance(name, str) and name.startswith('.skill-library-'):
+                raise PermissionError('simulated staging open failure')
+            fd = real_open(name, flags, *args, **kwargs)
+            if flags & os.O_DIRECTORY:
+                opened_dirs.append(fd)
+            return fd
+
+        def tracked_close(fd):
+            if fd in opened_dirs:
+                closed_dirs.append(fd)
+            return real_close(fd)
+
+        with patch.object(bootstrap.os, 'open', side_effect=tracked_open), \
+                patch.object(bootstrap.os, 'close', side_effect=tracked_close):
+            with self.assertRaisesRegex(PermissionError, 'staging open failure'):
+                bootstrap.write_target(self.path, plan['after'].encode(), self.original, True)
+        self.assertEqual(opened_dirs, closed_dirs)
+
+    def test_cli_returns_structured_error_on_invalid_target(self):
+        invalid = self.root / 'NOTES.md'
+        proc = subprocess.run(
+            [sys.executable, str(Path(bootstrap.__file__).resolve()), 'plan',
+             '--path', str(invalid), '--output', str(self.root / 'plan.json')],
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn('Traceback', proc.stderr)
+        self.assertIn('error', json.loads(proc.stderr))
+
+    def test_non_string_checksum_and_post_lock_symlink_swap_rejected(self):
+        plan = bootstrap.make_plan(self.path)
+        bad = dict(plan, before_sha256=None)
+        with self.assertRaisesRegex(LibraryError, 'checksum'):
+            bootstrap.validate(bad)
+
+        result = bootstrap.apply(plan, self.root / 'transactions')
+        real_flock = bootstrap.fcntl.flock
+        outside = self.root / 'outside.md'
+        outside.write_bytes(self.original)
+
+        def swap_to_symlink(fd, op):
+            real_flock(fd, op)
+            if not self.path.is_symlink():
+                self.path.unlink()
+                self.path.symlink_to(outside)
+
+        with patch.object(bootstrap.fcntl, 'flock', side_effect=swap_to_symlink):
+            with self.assertRaisesRegex(LibraryError, 'regular'):
+                bootstrap.rollback(result['transaction'])
+
+
+if __name__ == '__main__':
+    unittest.main()

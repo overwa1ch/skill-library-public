@@ -114,8 +114,9 @@ def target_value(doc, change, name=SERVER, fmt="codex-toml"):
     if change["kind"] == "server":
         table = "mcpServers" if fmt == "mcp-json" else "mcp_servers"
         return copy.deepcopy(plain(doc.get(table, {}).get(name)))
+    expected = str(canonical_path(change["path"]))
     for item in skill_entries(doc):
-        if str(canonical_path(item["path"])) == change["path"]:
+        if str(canonical_path(item["path"])) == expected:
             return copy.deepcopy(plain(item))
     return None
 
@@ -145,8 +146,9 @@ def set_target(doc, change, value, name=SERVER, fmt="codex-toml"):
     if "config" not in doc["skills"]:
         doc["skills"]["config"] = tomlkit.aot()
     items = doc["skills"]["config"]
+    expected = str(canonical_path(change["path"]))
     index = next((i for i, s in enumerate(items)
-                  if str(canonical_path(s["path"])) == change["path"]), None)
+                  if str(canonical_path(s["path"])) == expected), None)
     if value is None:
         if index is not None:
             del items[index]
@@ -171,8 +173,9 @@ def make_plan(config, registry, executable, program, ids=None, unavailable_ids=(
     config_existed = config.exists()
     before = config.read_bytes() if config_existed else b""
     doc = parse(before, fmt)
-    if fmt == "codex-toml":
-        skill_entries(doc)
+    existing_skills = ({str(canonical_path(item["path"])): copy.deepcopy(plain(item))
+                        for item in skill_entries(doc)}
+                       if fmt == "codex-toml" else {})
     lib = Library(registry)
     # Bind decisions and checksums to the same immutable registry snapshot.
     registry_before = lib.path.read_bytes()
@@ -202,7 +205,7 @@ def make_plan(config, registry, executable, program, ids=None, unavailable_ids=(
         if entry["enabled"] and (entry["placement"] == "library"
                                  or (fmt == "codex-toml" and entry["id"] in selected)):
             try:
-                loaded = lib.load(entry["id"])
+                loaded = lib.load(entry["id"], state=registry_state)
             except (LibraryError, OSError) as exc:
                 if entry["id"] not in approved_unavailable:
                     raise
@@ -237,15 +240,16 @@ def make_plan(config, registry, executable, program, ids=None, unavailable_ids=(
         raise LibraryError("Existing " + name + " server differs; do not overwrite")
     changes = [change] if change["before"] != server else []
     # JSON hosts read their own skill folders; only Codex lets the Library hide native entries.
-    for entry in (entries if fmt == "codex-toml" else ()):
-        desired = entry["enabled"] and lib.source_current(entry) if entry["placement"] == "global" else False
-        change = {"kind": "skill", "path": entry["path"]}
-        previous = target_value(doc, change)
-        if previous is None and desired:
-            continue
-        after = dict(previous or {"path": entry["path"]}, enabled=desired)
-        if previous != after:
-            changes.append(dict(change, before=previous, after=after))
+    if fmt == "codex-toml":
+        for entry in entries:
+            desired = entry["enabled"] and lib.source_current(entry) if entry["placement"] == "global" else False
+            change = {"kind": "skill", "path": entry["path"]}
+            previous = existing_skills.get(str(canonical_path(entry["path"])))
+            if previous is None and desired:
+                continue
+            after = dict(previous or {"path": entry["path"]}, enabled=desired)
+            if previous != after:
+                changes.append(dict(change, before=previous, after=after))
     plan = {"version": 1, "format": fmt, "server_name": name,
             "config": str(config), "before_sha256": sha(before),
             "config_existed": config_existed, "changes": changes,
@@ -363,14 +367,14 @@ def verify_inputs(plan):
                 or entry["path"] != item["path"]):
             raise LibraryError("Unavailable source state changed after plan")
         try:
-            lib.load(item["id"])
+            lib.load(item["id"], state=state)
         except (LibraryError, OSError) as exc:
             if sha(str(exc).encode()) != item["error_sha256"]:
                 raise LibraryError("Unavailable source changed after plan; regenerate plan") from exc
         else:
             raise LibraryError("Unavailable source recovered after plan; regenerate plan")
     for item in plan["sources"]:
-        loaded = lib.load(item.get("id"))
+        loaded = lib.load(item.get("id"), state=state)
         if (loaded["path"], loaded["sha256"]) != (item["path"], item["sha256"]):
             raise LibraryError("Skill changed after plan; regenerate plan")
         if loaded["policy_sha256"] != item["policy_sha256"]:
@@ -483,7 +487,7 @@ def rollback(txn):
         if record.get("status") == "rolling_back":
             restored = (sha(current) == record["rollback_result_sha256"]
                         and current_exists == record["rollback_result_existed"])
-            if not restored:
+            if not restored and current_exists:
                 # Preserve unrelated host edits made after a successful restore.
                 doc = parse(current, fmt)
                 restored = all(target_matches(doc, change, change["before"], name, fmt)
@@ -494,7 +498,7 @@ def rollback(txn):
             # Also recover legacy transactions interrupted after byte-exact restore.
             result = current
             restored = True
-        elif sha(current) == record["after_sha256"]:
+        elif current_exists and sha(current) == record["after_sha256"]:
             result = original
         else:
             doc = parse(current, fmt)
@@ -505,7 +509,7 @@ def rollback(txn):
             if fmt == "mcp-json" and record["changes"] and "mcpServers" in parse(original, fmt):
                 # Preserve the original container without restoring other hosts' keys.
                 doc.setdefault("mcpServers", {})
-            result = dumps(doc, fmt, current)
+            result = b"" if not record["config_existed"] and not plain(doc) else dumps(doc, fmt, current)
         result_exists = current_exists if restored else (record["config_existed"] or bool(result))
         if not restored:
             # Persist the recovery checkpoint before replacing or removing config.

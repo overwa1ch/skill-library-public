@@ -128,6 +128,39 @@ time.sleep(30)
                 except ProcessLookupError:
                     pass
 
+    def test_broken_pipe_during_stdin_close_still_closes_stdout_and_bad_shape_writes_nothing(self):
+        class BrokenStdin:
+            closed = False
+            def write(self, data):
+                return len(data)
+            def flush(self):
+                raise BrokenPipeError('child exited')
+            def close(self):
+                self.closed = True
+                raise BrokenPipeError('buffered flush failed on close')
+
+        proc = FakeProcess()
+        proc.stdin = BrokenStdin()
+        with self.assertRaises(BrokenPipeError):
+            self.run_probe(proc)
+        self.assertTrue(proc.stdout.closed)
+
+        bad_responses = '\n'.join((
+            json.dumps({'id': 1, 'result': {'version': 'fixture'}}),
+            json.dumps({'id': 2, 'result': {'data': []}}),
+        )) + '\n'
+        proc2 = FakeProcess(bad_responses)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        output = Path(temporary.name) / 'bad.json'
+        with patch.object(probe.subprocess, 'Popen', return_value=proc2), \
+                patch.object(sys, 'argv', ['probe', '--output', str(output)]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(IndexError):
+                probe.main()
+        self.assertFalse(output.exists())
+        self.assert_released(proc2)
+
 
 if __name__ == '__main__':
     unittest.main()

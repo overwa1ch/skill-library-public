@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import uuid
 
 from configure import atomic, sha
@@ -82,8 +83,9 @@ def write_target(path, data, expected, expected_exists, remove=False):
             if exists:
                 os.unlink(path.name, dir_fd=parent)
         else:
-            temp = '.skill-library-' + uuid.uuid4().hex
-            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
+            candidate = '.skill-library-' + uuid.uuid4().hex
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
+            temp = candidate
             with os.fdopen(fd, 'wb') as stream:
                 os.fchmod(stream.fileno(), mode)
                 stream.write(data)
@@ -98,9 +100,14 @@ def write_target(path, data, expected, expected_exists, remove=False):
         if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
             raise LibraryError('Bootstrap parent changed during replacement')
     finally:
-        if temp is not None:
-            os.unlink(temp, dir_fd=parent)
-        os.close(parent)
+        try:
+            if temp is not None:
+                try:
+                    os.unlink(temp, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(parent)
 
 
 def check_path(path):
@@ -147,6 +154,13 @@ def desired(text, host='codex'):
     return text + separator + block
 
 
+def decode_utf8(data, path):
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise LibraryError('Bootstrap target is not valid UTF-8: ' + str(path)) from exc
+
+
 def make_plan(path, host='codex'):
     if host not in BLOCKS:
         raise LibraryError('Unknown bootstrap host: ' + str(host))
@@ -155,9 +169,10 @@ def make_plan(path, host='codex'):
         raise LibraryError('Bootstrap requires a regular ' + ', '.join(INSTRUCTION_FILES) + ' path')
     path = raw.parent.resolve() / raw.name
     path = check_path(path)
-    before = path.read_bytes().decode('utf-8') if path.exists() else ''
+    existed = path.exists()
+    before = decode_utf8(path.read_bytes(), path) if existed else ''
     after = desired(before, host)
-    return {'version': 1, 'host': host, 'path': str(path), 'existed': path.exists(),
+    return {'version': 1, 'host': host, 'path': str(path), 'existed': existed,
             'before': before, 'after': after, 'before_sha256': sha(before.encode()),
             'after_sha256': sha(after.encode())}
 
@@ -171,9 +186,11 @@ def validate(record):
     if record.get('host', 'codex') not in BLOCKS:
         raise LibraryError('Unknown bootstrap host')
     for key in ('before', 'after'):
+        digest_val = record.get(key + '_sha256')
         if (not isinstance(record.get(key), str)
-                or not re.fullmatch('[0-9a-f]{64}', record.get(key + '_sha256', ''))
-                or sha(record[key].encode()) != record[key + '_sha256']):
+                or not isinstance(digest_val, str)
+                or not re.fullmatch('[0-9a-f]{64}', digest_val)
+                or sha(record[key].encode()) != digest_val):
             raise LibraryError('Bootstrap checksum mismatch')
     old, new = span(record['before']), span(record['after'])
     if not new:
@@ -188,8 +205,13 @@ def validate(record):
     if record['after'] != expected:
         raise LibraryError('Bootstrap record modifies unowned instructions')
     if record.get('status') == 'rolling_back':
+        rb_sha = record.get('rollback_result_sha256')
         if (not isinstance(record.get('rollback_result'), str)
-                or sha(record['rollback_result'].encode()) != record.get('rollback_result_sha256')):
+                or not isinstance(rb_sha, str)
+                or not re.fullmatch('[0-9a-f]{64}', rb_sha)
+                or sha(record['rollback_result'].encode()) != rb_sha
+                or ('rollback_result_existed' in record
+                    and type(record['rollback_result_existed']) is not bool)):
             raise LibraryError('Bootstrap rollback checkpoint checksum mismatch')
 
 
@@ -201,8 +223,10 @@ def apply(plan, transactions):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(str(path) + '.skill-library.lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        before = path.read_bytes() if path.exists() else b''
-        if sha(before) != plan['before_sha256'] or path.exists() != plan['existed']:
+        path = check_path(plan['path'])
+        before_exists = path.exists()
+        before = path.read_bytes() if before_exists else b''
+        if sha(before) != plan['before_sha256'] or before_exists != plan['existed']:
             raise LibraryError('Global instructions changed after plan')
         if plan['before'] == plan['after']:
             return {'changed': False, 'transaction': None}
@@ -210,7 +234,7 @@ def apply(plan, transactions):
         txn.mkdir(parents=True, mode=0o700)
         record = dict(plan, status='prepared')
         atomic(txn / 'transaction.json', (json.dumps(record, ensure_ascii=False, indent=2) + '\n').encode())
-        if (path.read_bytes() if path.exists() else b'') != before:
+        if path.exists() != before_exists or (path.read_bytes() if path.exists() else b'') != before:
             raise LibraryError('Global instructions changed during apply')
         write_target(path, plan['after'].encode(), before, plan['existed'])
         record['status'] = 'applied'
@@ -229,16 +253,31 @@ def rollback(transaction):
         return {'changed': False, 'status': 'already_rolled_back'}
     with open(str(path) + '.skill-library.lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        current = path.read_bytes().decode('utf-8') if path.exists() else ''
-        restored = (record.get('status') == 'rolling_back'
-                    and (current == record['rollback_result']
-                         or (span(current) is None and span(record['rollback_result']) is None)))
+        record = json.loads(txn.read_text())
+        validate(record)
+        if record.get('status') not in ('prepared', 'applied', 'rolling_back', 'rolled_back'):
+            raise LibraryError('Invalid bootstrap transaction status')
+        if record['path'] != str(path):
+            raise LibraryError('Bootstrap transaction changed while waiting for lock')
+        if record.get('status') == 'rolled_back':
+            return {'changed': False, 'status': 'already_rolled_back'}
+        path = check_path(record['path'])
+        current_exists = path.exists()
+        current = decode_utf8(path.read_bytes(), path) if current_exists else ''
+        restored = False
+        if record.get('status') == 'rolling_back':
+            expected_exists = record.get('rollback_result_existed',
+                                         record['existed'] or bool(record['rollback_result']))
+            restored = ((current == record['rollback_result'] and current_exists == expected_exists)
+                        or (current_exists and span(current) is None
+                            and span(record['rollback_result']) is None))
         if restored:
             result = current
-        elif sha(current.encode()) == record['after_sha256']:
-            result = record['before']
-        elif current == record['before']:
+        elif current == record['before'] and current_exists == record['existed']:
             result = current
+            restored = True
+        elif current_exists and sha(current.encode()) == record['after_sha256']:
+            result = record['before']
         else:
             now, old = span(current), span(record['before'])
             installed = span(record['after'])
@@ -250,17 +289,20 @@ def rollback(transaction):
                 separator = record['after'][len(record['before']):installed[0]]
                 if separator and result[max(0, now[0] - len(separator)):now[0]] == separator:
                     result = result[:now[0] - len(separator)] + result[now[0]:]
-        if (path.read_bytes().decode('utf-8') if path.exists() else '') != current:
+        result_exists = current_exists if restored else (record['existed'] or bool(result))
+        if (path.exists() != current_exists
+                or (decode_utf8(path.read_bytes(), path) if path.exists() else '') != current):
             raise LibraryError('Global instructions changed during rollback')
         if not restored:
             record.update(status='rolling_back', rollback_result=result,
-                          rollback_result_sha256=sha(result.encode()))
+                          rollback_result_sha256=sha(result.encode()),
+                          rollback_result_existed=result_exists)
             atomic(txn, (json.dumps(record, ensure_ascii=False, indent=2) + '\n').encode())
-            write_target(path, result.encode(), current.encode(), path.exists(),
-                         remove=not record['existed'] and not result)
+            write_target(path, result.encode(), current.encode(), current_exists,
+                         remove=not result_exists)
         record['status'] = 'rolled_back'
         atomic(txn, (json.dumps(record, ensure_ascii=False, indent=2) + '\n').encode())
-        return {'changed': result != current, 'status': 'rolled_back'}
+        return {'changed': result != current or current_exists != result_exists, 'status': 'rolled_back'}
 
 
 def main():
@@ -278,15 +320,20 @@ def main():
     p = sub.add_parser('rollback')
     p.add_argument('transaction')
     args = parser.parse_args()
-    if args.command == 'plan':
-        result = make_plan(args.path, args.host or default_host(args.path))
-        atomic(Path(args.output), (json.dumps(result, ensure_ascii=False, indent=2) + '\n').encode())
-        print(json.dumps({'plan': args.output, 'added_bytes': len(result['after'].encode()) - len(result['before'].encode())}))
-    elif args.command == 'apply':
-        print(json.dumps(apply(json.loads(Path(args.plan).read_text()), args.transactions)))
-    else:
-        print(json.dumps(rollback(args.transaction)))
+    try:
+        if args.command == 'plan':
+            result = make_plan(args.path, args.host or default_host(args.path))
+            atomic(Path(args.output), (json.dumps(result, ensure_ascii=False, indent=2) + '\n').encode())
+            print(json.dumps({'plan': args.output, 'added_bytes': len(result['after'].encode()) - len(result['before'].encode())}))
+        elif args.command == 'apply':
+            print(json.dumps(apply(json.loads(Path(args.plan).read_text()), args.transactions)))
+        else:
+            print(json.dumps(rollback(args.transaction)))
+        return 0
+    except (LibraryError, OSError, ValueError) as exc:
+        print(json.dumps({'error': str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

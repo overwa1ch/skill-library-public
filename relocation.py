@@ -188,16 +188,18 @@ class Relocator:
         if any(self.lib.entry(state, m['id'])['path'] != m[field] for m in mappings):
             raise self.error('Skill was rebound concurrently; relocation paths conflict')
 
-    def check_membership(self, state, mappings, root, target, allow_source_additions=False):
+    def check_membership(self, state, mappings, root, target, allow_source_additions=False,
+                         check_target=True):
         actual = set()
         expected = {m['id'] for m in mappings}
+        boundaries = (root, target) if check_target else (root,)
         for item in state['skills']:
             path = self.api.canonical_path(item['path'])
             if (allow_source_additions and item['id'] not in expected and root in path.parents
                     and target not in path.parents):
                 continue
             if any(boundary in path.parents or path.parent == boundary or
-                   path.parent in boundary.parents for boundary in (root, target)):
+                   path.parent in boundary.parents for boundary in boundaries):
                 actual.add(item['id'])
         if actual != expected:
             raise self.error('Package registry membership changed; nothing else moved')
@@ -280,8 +282,13 @@ class Relocator:
                 paths = [self.lib.entry(state, m['id'])['path'] for m in mappings]
                 before = all(p == m['from'] for p, m in zip(paths, mappings))
                 after = all(p == m['to'] for p, m in zip(paths, mappings))
+                unpublished = bool(record.get('unpublished') or (
+                    before and not exists(archive)
+                    and (exists(stage)
+                         or (record.get('target_identity') is None and not exists(saved)))))
                 self.check_membership(state, mappings, root, target,
-                                      allow_source_additions=before and not exists(archive))
+                                      allow_source_additions=before and not exists(archive),
+                                      check_target=not unpublished)
                 if not before and not after:
                     raise self.error('Skill was rebound concurrently; nothing restored')
                 # Validate every owned tree before changing any directory or registry.
@@ -294,16 +301,18 @@ class Relocator:
                     self.owned(root, record['source_identity'], manifest if after else None)
                 else:
                     raise self.error('Original and archive are both unavailable; nothing restored')
-                for path in (target, saved):
+                for path in ((saved,) if unpublished else (target, saved)):
                     if exists(path):
                         if path == target and record.get('target_identity') is None:
                             raise self.error('Library target ownership is unavailable; nothing restored')
                         self.owned(path, record.get('target_identity'),
                                    manifest if record.get('target_identity') is not None else None)
-                if exists(target) and exists(saved):
+                if not unpublished and exists(target) and exists(saved):
                     raise self.error('Both Library target and saved copy exist; nothing restored')
                 if after and not exists(target):
                     raise self.error('Active Library target is unavailable; nothing restored')
+                if unpublished:
+                    record['unpublished'] = True
                 self.save(directory, record, 'rolling_back')
                 if exists(archive):
                     self.move(archive, root)
@@ -314,7 +323,7 @@ class Relocator:
                 elif current != [m['from'] for m in mappings]:
                     raise self.error('Skill was rebound during rollback; original retained at ' + str(root))
                 def finish():
-                    if exists(target):
+                    if not unpublished and exists(target):
                         self.owned(target, record.get('target_identity'), manifest)
                         self.move(target, saved)
                     elif exists(stage):

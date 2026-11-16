@@ -100,7 +100,7 @@ class RelocateTests(unittest.TestCase):
             (self.one / "scripts" / "run.sh").write_text("echo updated\n")
             return result
 
-        with patch("library.shutil.copytree", side_effect=changed_source):
+        with patch("relocation.shutil.copytree", side_effect=changed_source):
             with self.assertRaisesRegex(LibraryError, "Relocation directory changed"):
                 self.relocate(entry["id"])
         self.assertEqual((self.one / "scripts" / "run.sh").read_text(), "echo updated\n")
@@ -200,6 +200,17 @@ class RelocateTests(unittest.TestCase):
         with self.assertRaisesRegex(LibraryError, "Original location is occupied"):
             self.lib.relocate_rollback(result["relocation"])
         self.assertEqual(self.lib.load(entry["id"])["skill_root"], str(target))
+
+    def test_relocate_refuses_internal_parent_symlink_composed_with_dotdot_escape(self):
+        entry = self.scanned()["fixture:host/one"]
+        sub = self.one / "sub"
+        sub.mkdir()
+        os.symlink("..", sub / "self")
+        os.symlink("self/../two/SKILL.md", sub / "escape")
+        self.assertTrue((sub / "escape").exists())
+        with self.assertRaisesRegex(LibraryError, "Relative link would break"):
+            self.relocate(entry["id"])
+        self.assertTrue(self.one.exists())
 
 
 if __name__ == "__main__":

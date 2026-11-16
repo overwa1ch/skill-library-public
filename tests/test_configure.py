@@ -147,3 +147,57 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), self.original)
         with self.assertRaises(LibraryError):
             make_plan(self.config, self.registry, sys.executable, self.program, [self.entry["id"]])
+
+    def test_post_registration_compatibility_symlink_does_not_duplicate_skill_config(self):
+        host_dir = self.root / "host-skill"
+        host_dir.mkdir()
+        skill_path = host_dir / "SKILL.md"
+        skill_path.write_text("---\nname: compat\ndescription: Compat test.\n---\nBody\n")
+        entry = self.lib.register(skill_path, "compat")
+        first = self.apply()
+        archived = self.root / "archive-skill"
+        host_dir.rename(archived)
+        host_dir.symlink_to(archived, target_is_directory=True)
+        second_plan = self.plan()
+        self.assertEqual(second_plan["changes"], [])
+        self.lib.edit(entry["id"], placement="global")
+        enable_plan = self.plan()
+        self.assertEqual(len(enable_plan["changes"]), 1)
+        enable_txn = apply(enable_plan, self.root / "transactions")
+        parsed = tomlkit.parse(self.config.read_text()).unwrap()
+        self.assertEqual(len(parsed["skills"]["config"]), 2)
+        rollback(enable_txn["transaction"])
+        rollback(first["transaction"])
+        self.assertEqual(self.config.read_bytes(), self.original)
+
+    def test_deleted_config_during_rolling_back_is_conflict_not_restored(self):
+        json_cfg = self.root / "mcp.json"
+        json_cfg.write_text('{"theme": "precious"}\n')
+        plan = make_plan(json_cfg, self.registry, sys.executable, self.program, fmt="mcp-json")
+        result = apply(plan, self.root / "transactions")
+        import configure, unittest.mock
+        real_atomic = configure.atomic
+        def fail_target(path, *args, **kwargs):
+            if Path(path).resolve() == json_cfg.resolve():
+                raise OSError("interrupted before target restore")
+            return real_atomic(path, *args, **kwargs)
+        with unittest.mock.patch.object(configure, "atomic", side_effect=fail_target):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                rollback(result["transaction"])
+        json_cfg.unlink()
+        with self.assertRaisesRegex(LibraryError, "conflict"):
+            rollback(result["transaction"])
+
+    def test_new_mcp_json_reformatted_by_host_unlinks_cleanly_on_rollback(self):
+        json_cfg = self.root / "fresh-mcp.json"
+        plan = make_plan(json_cfg, self.registry, sys.executable, self.program, fmt="mcp-json")
+        result = apply(plan, self.root / "transactions")
+        self.assertTrue(json_cfg.exists())
+        compact = json.loads(json_cfg.read_text())
+        json_cfg.write_text(json.dumps(compact, separators=(",", ":")))
+        rollback(result["transaction"])
+        self.assertFalse(json_cfg.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

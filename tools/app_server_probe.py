@@ -86,11 +86,21 @@ def main():
         if args.mcp_server:
             result["mcp"] = call(3, "mcpServerStatus/list",
                                  {"serverName": args.mcp_server, "detail": "toolsAndAuthOnly"})
-        Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         items = skills["data"][0]["skills"]
+        enabled_count = sum(s["enabled"] for s in items)
+        mcp_count = len(result.get("mcp", {}).get("data", []))
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_path.with_name(f".probe-{os.getpid()}-{out_path.name}")
+        try:
+            tmp_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp_path, out_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
         print(json.dumps({"output": args.output, "surface": result["surface"],
-                          "skills": len(items), "enabled": sum(s["enabled"] for s in items),
-                          "mcp_servers": len(result.get("mcp", {}).get("data", []))}))
+                          "skills": len(items), "enabled": enabled_count,
+                          "mcp_servers": mcp_count}))
     finally:
         stopped.set()
         try:
@@ -103,8 +113,13 @@ def main():
                 proc.wait(timeout=5)
         finally:
             reader_thread.join(timeout=1)
-            proc.stdin.close()
-            proc.stdout.close()
+            try:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            finally:
+                proc.stdout.close()
 
 
 if __name__ == "__main__":

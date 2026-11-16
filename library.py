@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import sys
 import tempfile
@@ -84,9 +83,9 @@ def read_skill(path):
         data = path.read_bytes()
         text = data.decode("utf-8")
         lines = text.splitlines()
-        if not lines or lines[0].strip() != "---":
+        if not lines or lines[0].rstrip(" \t") != "---":
             raise LibraryError("Missing YAML frontmatter: " + str(path))
-        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+        end = next(i for i in range(1, len(lines)) if lines[i].rstrip(" \t") == "---")
         meta = yaml.safe_load("\n".join(lines[1:end]))
         if not isinstance(meta, dict):
             raise LibraryError("Frontmatter must be a mapping: " + str(path))
@@ -181,6 +180,8 @@ def relative_link_depends_on_root(parent, target, root):
             continue
         if part == "..":
             current = current.parent
+            if current != root and root not in current.parents:
+                return True
             continue
         candidate = current / part
         if not candidate.is_symlink():
@@ -363,8 +364,6 @@ class Library:
                 elif target != "unknown":
                     raise LibraryError("Unknown source-state target")
                 entry["source_state"] = dict(after)
-            # Validate the entire batch before the transaction writes any changes.
-            self.validate(state)
         return {"changed": len(plan["changes"]), "evidence_sha256": evidence_sha}
 
     @contextlib.contextmanager
@@ -462,23 +461,26 @@ class Library:
         self.validate({"version": 1, "skills": prepared})
         imported = []
         with self.transaction() as state:
+            by_path = {str(canonical_path(s["path"])): s for s in state["skills"]}
+            sources = {s["source"] for s in state["skills"]}
             for candidate in prepared:
                 if candidate['enabled']:
                     # Recheck after taking the registry lock: a relocation may
                     # have moved this source while registration was waiting.
                     read_skill(candidate['path'])
-                previous = next((s for s in state["skills"]
-                                 if str(canonical_path(s["path"])) == candidate["path"]), None)
+                previous = by_path.get(candidate["path"])
                 if previous is not None:
                     if (previous["source"], previous["scope"]) != (candidate["source"], candidate["scope"]):
                         raise LibraryError("Source conflict for existing path; resolve explicitly")
                     # Repeated scans never reset manual status, placement or tags.
                     imported.append(dict(previous))
                     continue
-                if any(s["source"] == candidate["source"] for s in state["skills"]):
+                if candidate["source"] in sources:
                     raise LibraryError("Source already registered at another path; use edit --path to rebind")
                 candidate["tags"] = list(dict.fromkeys(candidate["tags"]))
                 state["skills"].append(candidate)
+                by_path[candidate["path"]] = candidate
+                sources.add(candidate["source"])
                 imported.append(dict(candidate))
         return imported
 
@@ -531,8 +533,8 @@ class Library:
             items.append({**entry, **skill})
         return items
 
-    def load(self, sid, tool=False):
-        entry = self.entry(self.read(), sid)
+    def load(self, sid, tool=False, *, state=None):
+        entry = self.entry(self.read() if state is None else state, sid)
         if not entry["enabled"]:
             raise LibraryError("Skill is disabled: " + sid)
         self.require_current(entry)
@@ -606,10 +608,11 @@ class Library:
     def tools(self):
         return self._tools_for_skills(self.listing(tools_only=True))
 
-    def catalog_status(self):
+    def catalog_status(self, state=None):
         """Read live sources independently; never cache a failed source's metadata."""
+        state = self.read() if state is None else state
         skills, errors = [], []
-        for entry in self.read()["skills"]:
+        for entry in state["skills"]:
             if not entry["enabled"] or entry["placement"] != "library":
                 continue
             if self.source_inactive(entry):
@@ -625,8 +628,9 @@ class Library:
         return skills, errors
 
     def mcp_tools(self):
-        skills, errors = self.catalog_status()
-        inactive = any(self.source_inactive(e) for e in self.read()["skills"])
+        state = self.read()
+        skills, errors = self.catalog_status(state)
+        inactive = any(self.source_inactive(e) for e in state["skills"])
         if not errors and not inactive:
             return self._tools_for_skills(skills)
         if not skills and errors:
@@ -644,9 +648,10 @@ class Library:
         return tools
 
     def status(self):
-        skills, errors = self.catalog_status()
+        state = self.read()
+        skills, errors = self.catalog_status(state)
         return {"state": "degraded" if errors else "healthy", "unavailable": errors,
-                "inactive_sources": [dict(e) for e in self.read()["skills"] if self.source_inactive(e)],
+                "inactive_sources": [dict(e) for e in state["skills"] if self.source_inactive(e)],
                 "available_implicit": sum(s["allow_implicit_invocation"] for s in skills),
                 "available_explicit": sum(not s["allow_implicit_invocation"] for s in skills),
                 "explicit_loading_available": any(not s["allow_implicit_invocation"] for s in skills),
@@ -762,10 +767,15 @@ def serve(lib, host="auto"):
 
     threading.Thread(target=watch, daemon=True).start()
     try:
-        for line in sys.stdin:
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        while True:
+            raw = stream.readline()
+            if not raw:
+                break
             rid = None
             req = {}
             try:
+                line = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
                 req = json.loads(line)
                 if (not isinstance(req, dict) or req.get("jsonrpc") != "2.0"
                         or not isinstance(req.get("method"), str)
@@ -806,7 +816,9 @@ def serve(lib, host="auto"):
                     result = {"tools": catalog}
                 elif method == "tools/call":
                     name = params.get("name", "")
-                    args = params.get("arguments", {})
+                    args = params.get("arguments")
+                    if args is None:
+                        args = {}
                     if name == "library_status":
                         if args != {}:
                             raise LibraryError("Library status accepts no arguments")
@@ -836,7 +848,7 @@ def serve(lib, host="auto"):
                         "content": [{"type": "text", "text": str(exc)}], "isError": True}})
                 else:
                     emit({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": str(exc)}})
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 emit({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}})
             except (ValueError, TypeError) as exc:
                 emit({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": str(exc)}})
@@ -884,7 +896,7 @@ def main():
     edit.add_argument("--path", help="Explicitly rebind an existing identity to an updated source path")
     move = sub.add_parser("relocate", help="Move a skill's folder out of host skill folders into the Library")
     move.add_argument("id")
-    move.add_argument("--into", help="Library-owned folder (default: skills/ beside the registry)")
+    move.add_argument("--into", help="Library-owned folder (default: sources/personal/ or sources/plugins/ beside the registry)")
     boundary = move.add_mutually_exclusive_group(required=True)
     boundary.add_argument("--package-root", help="Confirmed complete package root to move, preserving its layout")
     boundary.add_argument("--self-contained", action="store_true",
